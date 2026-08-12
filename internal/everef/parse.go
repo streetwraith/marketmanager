@@ -39,9 +39,16 @@ type Filter struct {
 	// Regions limits the import to the regions this service tracks. EVE Ref
 	// publishes all ~77 regions, of which ours are about 70% of each file.
 	Regions map[int64]bool
-	// After keeps only rows scraped since the last import. This is what makes a
-	// re-import cheap: a day file grows in waves, and without this filter each
-	// re-import rewrites every row it already holds.
+	// After keeps only rows scraped at or after the last import's watermark. This
+	// is what makes a re-import cheap: a day file grows in waves, and without this
+	// filter each re-import rewrites every row it already holds.
+	//
+	// The bound is inclusive, and that is not a detail. EVE Ref stamps every record
+	// of one scrape batch with an identical http_last_modified, and keeps appending
+	// to the file afterwards. An exclusive bound therefore rejects the whole tail of
+	// the batch it last read, permanently: measured on 2026-08-10, all 45,127
+	// records of the file carried one timestamp, so an exclusive bound held the day
+	// at 5,117 of 31,134 tracked rows with no later batch to rescue it.
 	After time.Time
 }
 
@@ -94,7 +101,7 @@ func Parse(r io.Reader, f Filter) (rows []Row, watermark time.Time, total int, e
 		if f.Regions != nil && !f.Regions[regionID] {
 			continue
 		}
-		if !f.After.IsZero() && !lm.After(f.After) {
+		if !f.After.IsZero() && lm.Before(f.After) {
 			continue
 		}
 

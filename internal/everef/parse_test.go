@@ -64,18 +64,53 @@ func TestParseWatermarkKeepsOnlyNewWaves(t *testing.T) {
 		t.Errorf("watermark = %v, want %v", wm, want)
 	}
 
-	// Re-import after the first two waves: only the third is new.
+	// Re-import after the first wave. The bound is inclusive, so the wave it last
+	// read comes back too: that wave may have grown since, and the upsert absorbs
+	// the overlap. Only the strictly older wave is skipped.
 	after := time.Date(2026, 8, 7, 11, 2, 41, 0, time.UTC)
 	rows, wm2, _ := mustParse(t, in, Filter{Regions: all, After: after})
-	if len(rows) != 1 {
-		t.Fatalf("kept %d rows after the watermark, want 1", len(rows))
+	if len(rows) != 2 {
+		t.Fatalf("kept %d rows at or after the watermark, want 2", len(rows))
 	}
-	if rows[0].TypeID != 36 {
-		t.Errorf("kept type %d, want 36", rows[0].TypeID)
+	for _, r := range rows {
+		if r.TypeID == 34 {
+			t.Error("kept a row from a wave strictly older than the watermark")
+		}
 	}
 	// The watermark must still advance from every row, not just the kept ones.
 	if !wm2.Equal(want) {
 		t.Errorf("watermark = %v, want %v", wm2, want)
+	}
+}
+
+// The failure this guards against cost 26,017 rows of 2026-08-10 on the dev
+// database. EVE Ref stamps every record of one scrape batch with an identical
+// http_last_modified and keeps appending to the file for hours afterwards. So the
+// watermark a first import stores is equal to, not below, the timestamp of the
+// rows that arrive next. An exclusive bound drops all of them, and because the
+// file carries only that one timestamp, no later wave ever rescues them.
+func TestParseKeepsLaterRowsOfTheSameScrapeBatch(t *testing.T) {
+	const batch = "2026-08-10T11:03:07Z"
+	all := map[int64]bool{10000002: true}
+
+	// First import: the file holds one row and the watermark becomes the batch time.
+	first, wm, _ := mustParse(t, header+row(batch, 10000002, 34, "1.00"), Filter{Regions: all})
+	if len(first) != 1 {
+		t.Fatalf("first import kept %d rows, want 1", len(first))
+	}
+
+	// The file has since grown, with every new row in the same batch.
+	grown := header +
+		row(batch, 10000002, 34, "1.00") +
+		row(batch, 10000002, 35, "2.00") +
+		row(batch, 10000002, 36, "3.00")
+
+	rows, _, total := mustParse(t, grown, Filter{Regions: all, After: wm})
+	if total != 3 {
+		t.Fatalf("scanned %d records, want 3", total)
+	}
+	if len(rows) != 3 {
+		t.Fatalf("kept %d rows, want 3; the tail of the batch was dropped and is unrecoverable", len(rows))
 	}
 }
 
