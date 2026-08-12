@@ -184,6 +184,11 @@ Latency stays flat from 8 to 96, so ESI itself does not degrade under this load;
 appeared across about 11,000 requests. Throughput scales almost linearly to 64 and then knees, with
 96 buying only 18% more. 64 is the knee, which is why it is the default.
 
+**That sweep used a fresh HTTP/1.1 connection per request, so its numbers do not carry over to the
+service**, which negotiates HTTP/2 and multiplexes onto one connection. The 64 default is therefore
+a ceiling that the service never reaches — see "One TCP connection carries the whole sweep" below
+for what actually binds. Re-run this sweep against the real client before treating 64 as tuned.
+
 ### The legacy error limit is a second, separate limit
 
 Independent of the token bucket, ESI allows **100 non-2xx/3xx responses per minute per IP**, then
@@ -227,6 +232,43 @@ Note that setting `Transport.DialContext` disables automatic HTTP/2 negotiation 
 `ForceAttemptHTTP2` is also set. Without h2 the sweep would fall back to one request per
 connection. `TestLiveStillNegotiatesHTTP2` guards this.
 
+### One TCP connection carries the whole sweep, and it caps throughput near 90 req/s
+
+`FETCH_CONCURRENCY` does not do what its name suggests. Go's HTTP/2 transport multiplexes every
+request onto a **single** TCP connection per host and queues beyond the server's stream limit rather
+than dialing a second one. `MaxConnsPerHost` does not change this; it governs the HTTP/1.1 path.
+Confirmed by sampling `ss -tnp` during an active sweep: exactly one established connection to ESI.
+
+The measurable consequence is a fixed ceiling of about **8-10 requests genuinely in flight**,
+whatever `FETCH_CONCURRENCY` says. Derived as `pages/s x single-request latency`, on a host with
+~200ms latency:
+
+| Region | Pages | Achieved | In flight |
+|---|---|---|---|
+| The Forge | 413 | 47.5 pages/s | ~9.5 |
+| Domain | 182 | 45.5 pages/s | ~9.1 |
+| Heimatar | 74 | 33.7 pages/s | ~6.7 |
+| Khanid | 11 | 16.5 pages/s | ~3.3 |
+
+The ceiling is flat from 11 pages to 413, which is what distinguishes a pipeline limit from a
+ramp-up effect. It also explains an observed hour where fan-out throughput halved while
+single-request latency stayed flat and one page failed with `http2: client connection` — contention
+on the shared connection, not a slower server.
+
+**Why this is left alone.** Throughput is capped at `in_flight / latency`, so the ceiling only binds
+below roughly 90 req/s. At `FETCH_RPS=70` on a low-latency host the rate limiter binds first and the
+single connection costs nothing. On the measured high-latency host it costs about 10s of fetching
+per cycle against a 27% duty cycle, so nothing waits for it.
+
+**Why it matters anyway: raising `FETCH_RPS` above about 90 buys nothing until this is fixed.** The
+fix is a small pool of transports, each with its own `DialContext`, with requests spread across
+them — several connections, several congestion windows. Treat it as a precondition for raising the
+rate cap, not as a standalone optimisation.
+
+One related wart, worth correcting alongside it: `get` takes the concurrency slot *before* waiting
+on the rate limiter, so slots are held by goroutines doing no I/O. That makes the two knobs
+interact instead of bounding different things.
+
 ### Cold start
 
 A naive start fits **four** full cycles into the first 15-minute window instead of three, because
@@ -250,15 +292,16 @@ the next tick, which costs nothing.
 Regions are refreshed **one at a time, in priority order**, so a hub never waits behind a region
 nobody reads, and the pipeline has no per-region concurrency to tune.
 
-That ordering is not free, and the original plan was wrong to claim it was. The plan assumed the
-global request rate would bind, making a full pass about 22s (1,516 pages at 70 req/s). Measured
-over 208 full passes on a high-latency host, the pass takes **146s at p50 and 253s at p90**, and
-The Forge sustains 33.8 pages/s against a 70 req/s cap. Concurrency binds, not the rate cap, and
-each region's apply and verify are time when no request is in flight.
+Sequential processing leaves ample headroom. All 25 regions' work sums to about **80s per 300s
+cycle, a 27% duty cycle**, measured across a full day on a high-latency host; the worst hour
+observed reached 50%. Regions therefore do not queue behind each other, and the serial worker is
+idle roughly three quarters of the time.
 
-This is a wall-time cost, not a correctness problem: every region still refreshes on its own 300s
-`Expires` cadence, and a pass fits inside it. The freshness a reader actually sees, measured as
-`refreshed_at - last_modified` off-peak:
+Do not measure this by grouping refresh completions into "passes" separated by an idle gap. Regions
+run on independent 300s cadences, so completions are near-continuous and no such gap exists; that
+method reports a meaningless figure. Sum `total_ms` over a window and divide by the window instead.
+
+The freshness a reader actually sees, measured as `refreshed_at - last_modified` off-peak:
 
 | Region | Pages | Publish lag | of which fetch | apply + verify |
 |---|---|---|---|---|
@@ -309,12 +352,34 @@ Two properties of that dataset shape the importer:
 2. **Re-importing naively rewrites everything.** Because a day fills in waves,
    importing it four times would write roughly 2.6 rows for every row stored. Each
    row carries an `http_last_modified` stamp, so the importer keeps a per-day
-   watermark and only upserts rows scraped since the last pass. Measured on live
-   data, two consecutive passes upserted 53,981 rows and stored 53,981 rows: no
-   rewrites at all.
+   watermark and only upserts rows scraped at or after the last pass.
 
 Only tracked regions are stored. EVE Ref publishes ~77 regions, of which the 25
-this service follows are about 68-70% of every file.
+this service follows are about 68-70% of every file. **That share is the health
+check for an import**: a day materially below it is missing rows, not quiet.
+
+### The watermark bound is inclusive, and must stay that way
+
+EVE Ref stamps every record of one scrape batch with an **identical**
+`http_last_modified`, then keeps appending to the file for hours. A first import
+therefore stores a watermark *equal to* the timestamp of the rows that arrive
+next, not below it.
+
+An exclusive bound consequently drops the entire tail of the batch it last read,
+and because a file can carry only that one distinct timestamp, no later wave ever
+rescues those rows. Observed on 2026-08-10: all 45,127 records of the file shared
+one timestamp, of which 31,134 were for tracked regions, and an exclusive bound
+held the day at **5,117 rows permanently** while three re-import passes kept zero.
+Two neighbouring days were stuck at 55-56% of their file for the same reason.
+
+The inclusive bound cannot reintroduce the write amplification it was built to
+prevent, because `selectDays` only re-fetches a day whose record count actually
+grew. `TestParseKeepsLaterRowsOfTheSameScrapeBatch` holds this.
+
+Beware the check that hid this for a day: `rows_upserted == stored` proves only
+that nothing was **rewritten**. It says nothing about whether the rows ever
+arrived, and it reads as a clean pass while a day sits at 11% of its file. Compare
+against the 68-70% share instead.
 
 Both the compressed response and its expansion are capped. EVE Ref is a
 third-party, best-effort service and bzip2 reaches roughly 1000:1 on crafted
