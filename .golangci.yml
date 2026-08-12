@@ -1,0 +1,25 @@
+# Reproducible lint configuration. AGENTS.md requires `golangci-lint run` to pass.
+#
+# The default set is thin for a service that talks to SQL and HTTP, so the
+# linters that catch the failure modes this codebase can actually have are
+# enabled explicitly: leaked bodies and rows, missing context, wrapped-error
+# comparisons, and swallowed errors.
+version: "2"
+
+linters:
+  default: standard
+  enable:
+    - bodyclose
+    - contextcheck
+    - durationcheck
+    - errorlint
+    - gosec
+    - makezero
+    - nilerr
+    - noctx
+    - prealloc
+    - rowserrcheck
+    - sqlclosecheck
+    - unconvert
+    - unparam
+    - wastedassign
