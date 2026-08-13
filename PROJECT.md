@@ -170,24 +170,11 @@ Two limits are configured, and whichever binds first, binds:
 Fixing only concurrency would make a low-latency host an order of magnitude more aggressive than a
 high-latency one for the same setting.
 
-Concurrency was chosen by measurement, sweeping one 182-page region from a high-latency host:
-
-| Concurrency | Pages/s | p50 | p90 | Errors |
-|---|---|---|---|---|
-| 8 | 9.6 | 805 ms | 979 ms | none |
-| 16 | 19.1 | 758 ms | 933 ms | none |
-| 32 | 34.0 | 864 ms | 959 ms | none |
-| **64** | **67.9** | 779 ms | 897 ms | none |
-| 96 | 80.0 | 859 ms | 969 ms | none |
-
-Latency stays flat from 8 to 96, so ESI itself does not degrade under this load; no 429 and no 420
-appeared across about 11,000 requests. Throughput scales almost linearly to 64 and then knees, with
-96 buying only 18% more. 64 is the knee, which is why it is the default.
-
-**That sweep used a fresh HTTP/1.1 connection per request, so its numbers do not carry over to the
-service**, which negotiates HTTP/2 and multiplexes onto one connection. The 64 default is therefore
-a ceiling that the service never reaches — see "One TCP connection carries the whole sweep" below
-for what actually binds. Re-run this sweep against the real client before treating 64 as tuned.
+Concurrency was first tuned with an HTTP/1.1 sweep that scaled almost linearly to 64 in flight,
+which made 64 the original default. That sweep opened a fresh connection per request, so its
+numbers never applied to the real client, which negotiates HTTP/2 — and the h2 measurements
+showed the true constraint is server-side. The default is now **16**; see "ESI grants each
+source IP a throughput allowance" below for the measurements that set it.
 
 ### The legacy error limit is a second, separate limit
 
@@ -318,10 +305,11 @@ the next tick, which costs nothing.
 Regions are refreshed **one at a time, in priority order**, so a hub never waits behind a region
 nobody reads, and the pipeline has no per-region concurrency to tune.
 
-Sequential processing leaves ample headroom. All 25 regions' work sums to about **80s per 300s
-cycle, a 27% duty cycle**, measured across a full day on a high-latency host; the worst hour
-observed reached 50%. Regions therefore do not queue behind each other, and the serial worker is
-idle roughly three quarters of the time.
+Sequential processing leaves ample headroom off-peak. All 25 regions' work sums to about **80s
+per 300s cycle, a 27% duty cycle**, measured across a full day on a high-latency host. At EVE
+prime time the per-IP allowance (see "Rate limiting") can stretch a pass to most of the window:
+the old 64 in-flight default lost half its hub refreshes to timeouts there, while a measured
+prime evening on the 16 default held the full cadence.
 
 Do not measure this by grouping refresh completions into "passes" separated by an idle gap. Regions
 run on independent 300s cadences, so completions are near-continuous and no such gap exists; that

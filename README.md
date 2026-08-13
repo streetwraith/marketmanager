@@ -27,6 +27,13 @@ The service creates its own tables on start, guarded by a Postgres advisory lock
 cannot race during a rolling deploy. The `market` schema itself must already exist and be owned by
 the connecting role; see `PROJECT.md` for the one-time bootstrap.
 
+Run exactly **one** instance. Staging tables are named per region and truncated each cycle, so two
+instances corrupt each other's snapshots; the advisory lock protects only the migrations, not the
+steady state. Prefer stop-then-start over a rolling deploy — a brief ingestion gap costs nothing,
+because the previous snapshot stays live and the next refresh is at most five minutes away. Avoid
+repeated restarts inside one 15-minute window: each start spends 50 ESI tokens learning the
+regions' `Expires` ticks, and the token budget is a sliding window.
+
 ## Configuration
 
 All configuration comes from the environment. There is no config file. `.env.example` holds the
