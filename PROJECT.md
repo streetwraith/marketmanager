@@ -222,6 +222,8 @@ open in a few seconds is dead, and failing fast on it costs nothing.
 far more generous. Measured per-request latency swings from **~0.8s off-peak to ~15s during EVE
 prime time** (18:00-21:00 CEST) with identical payloads — a network and upstream-load effect, not
 more data. A timeout tuned for the quiet case would fire on more than half of every sweep at peak.
+Most of that swing is queueing against ESI's per-IP throughput allowance and scales with offered
+in-flight, so `FETCH_CONCURRENCY` sets how close a sweep runs to this timeout (see below).
 
 That asymmetry matters more than it looks: **a client-side timeout does not cancel the server's
 work.** ESI has already processed the request and charged the token, so an early timeout wastes it
@@ -232,42 +234,66 @@ Note that setting `Transport.DialContext` disables automatic HTTP/2 negotiation 
 `ForceAttemptHTTP2` is also set. Without h2 the sweep would fall back to one request per
 connection. `TestLiveStillNegotiatesHTTP2` guards this.
 
-### One TCP connection carries the whole sweep, and it caps throughput near 90 req/s
+### ESI grants each source IP a throughput allowance, and client knobs cannot lift it
 
-`FETCH_CONCURRENCY` does not do what its name suggests. Go's HTTP/2 transport multiplexes every
-request onto a **single** TCP connection per host and queues beyond the server's stream limit rather
-than dialing a second one. `MaxConnsPerHost` does not change this; it governs the HTTP/1.1 path.
-Confirmed by sampling `ss -tnp` during an active sweep: exactly one established connection to ESI.
+First, the Go behaviour that started this investigation, because it is real and worth knowing:
+Go's HTTP/2 transport multiplexes every request onto a **single** TCP connection per host, and
+`MaxConnsPerHost` governs only the HTTP/1.1 path. Confirmed by sampling `ss -tnp` during an active
+sweep: exactly one established connection to ESI. As of Go 1.26 there is no built-in way to spread
+load across h2 connections below the server's stream limit; `Transport.NewClientConn` exists so
+that a pool can be built by hand.
 
-The measurable consequence is a fixed ceiling of about **8-10 requests genuinely in flight**,
-whatever `FETCH_CONCURRENCY` says. Derived as `pages/s x single-request latency`, on a host with
-~200ms latency:
+That single connection was the suspected throughput ceiling. Measurement disproved it. A
+round-robin pool of cloned transports — one TCP connection each, mechanics verified against a
+local h2 server — was benchmarked live against real order pages, 64 in flight, 150 pages per arm:
 
-| Region | Pages | Achieved | In flight |
-|---|---|---|---|
-| The Forge | 413 | 47.5 pages/s | ~9.5 |
-| Domain | 182 | 45.5 pages/s | ~9.1 |
-| Heimatar | 74 | 33.7 pages/s | ~6.7 |
-| Khanid | 11 | 16.5 pages/s | ~3.3 |
+| Connections | req/s | p50 |
+|---|---|---|
+| 1 | 34.8 | 1381ms |
+| 2 | 37.2 | 770ms |
+| 4 | 24.9 | 1884ms |
+| 8 | 41.8 | 1160ms |
 
-The ceiling is flat from 11 pages to 413, which is what distinguishes a pipeline limit from a
-ramp-up effect. It also explains an observed hour where fan-out throughput halved while
-single-request latency stayed flat and one page failed with `http2: client connection` — contention
-on the shared connection, not a slower server.
+Flat. A concurrency ladder at fixed connections (80 pages per arm) shows where the ceiling
+actually lives:
 
-**Why this is left alone.** Throughput is capped at `in_flight / latency`, so the ceiling only binds
-below roughly 90 req/s. At `FETCH_RPS=70` on a low-latency host the rate limiter binds first and the
-single connection costs nothing. On the measured high-latency host it costs about 10s of fetching
-per cycle against a 27% duty cycle, so nothing waits for it.
+| In flight | req/s | p50 |
+|---|---|---|
+| 8 | 27.8 | 187ms |
+| 16 | 34.8 | 204ms |
+| 32 | 27.9 | 847ms |
+| 64 | 35.6 | 1875ms |
 
-**Why it matters anyway: raising `FETCH_RPS` above about 90 buys nothing until this is fixed.** The
-fix is a small pool of transports, each with its own `DialContext`, with requests spread across
-them — several connections, several congestion windows. Treat it as a precondition for raising the
-rate cap, not as a standalone optimisation.
+Throughput stays flat while latency inflates tenfold, and at 64 in flight p50 equals p95. That is
+a server-side fair queue: **ESI grants each source IP a throughput allowance and parks everything
+offered above it**. The allowance moves with EVE server load — measured across 48 hours of
+sweeps, ~45-65 pages/s at quiet hours and **3-10 pages/s during EVE prime time** (roughly
+16:00-22:00 CEST). The other suspects are cleared directly: ESI advertises
+`MAX_CONCURRENT_STREAMS=128`, Go's h2 receive windows are 4 MB per stream and 1 GB per
+connection, and `x/time/rate` at burst=1 delivers 98% of its configured rate under contention.
 
-One related wart, worth correcting alongside it: `get` takes the concurrency slot *before* waiting
-on the rate limiter, so slots are held by goroutines doing no I/O. That makes the two knobs
-interact instead of bounding different things.
+Consequences, in order of importance:
+
+- **`FETCH_CONCURRENCY` is the knob that matters, and lower is better.** Offered in-flight sets
+  the server-side queue time: `latency ≈ in_flight / allowance`. At the prime-time allowance of
+  ~4 pages/s, 64 in flight meant ~15s per request — brushing the 30s request timeout, and one
+  4-hour prime window logged 29 timeouts, 10 failed sweeps and 5 inconsistent page sets. The
+  default is therefore **16**: it saturates the allowance in every measured regime (16/0.3s ≈ 53
+  off-peak, 16/4s = 4 at prime) while keeping per-request latency far from the timeout.
+- **`FETCH_RPS=70` almost never binds** — the allowance sat below it at every measured hour. It
+  stays as the politeness backstop, not as a throughput target; raising it buys nothing.
+- **A connection pool is rejected on evidence, not deferred.** The sweep stays on the single h2
+  connection.
+- An earlier reading of this data — a fixed ~8-10 in-flight pipeline limit on the single
+  connection, capping throughput near 90 req/s — was wrong. In-flight ≈ throughput × latency was
+  a symptom of the allowance, not a transport property.
+
+The allowance was measured from one host and one IP. A deployment on another address should
+re-derive it from the achieved rate (`pages / fetch_ms`) rather than trust these numbers.
+
+One wart stands in the client: `get` takes the concurrency slot *before* waiting on the rate
+limiter, so slots are held by goroutines doing no I/O. That makes the two knobs interact instead
+of bounding different things.
 
 ### Cold start
 

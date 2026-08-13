@@ -48,14 +48,17 @@ Two values are required and the service refuses to start without them:
 | `ESI_CONNECT_TIMEOUT` | `5s` | Bounds the TCP dial and the TLS handshake only. |
 | `ESI_REQUEST_TIMEOUT` | `30s` | Bounds the whole request including the body read. |
 | `FETCH_RPS` | `70` | Global request rate cap. The politeness contract. |
-| `FETCH_CONCURRENCY` | `64` | Global ceiling on requests in flight. |
+| `FETCH_CONCURRENCY` | `16` | Global ceiling on requests in flight. |
 
 `ESI_REQUEST_TIMEOUT` must be at least `ESI_CONNECT_TIMEOUT`. The two are separate because they
 fail for different reasons: a connection that will not open is dead, while a slow response is
 merely slow. See `PROJECT.md` for why the request timeout is deliberately generous.
 
 `FETCH_RPS` binds where network latency is low and `FETCH_CONCURRENCY` binds where it is high.
-Whichever binds first, binds.
+Whichever binds first, binds. ESI also grants each source IP a throughput allowance and queues
+everything offered above it, so raising either knob past the allowance only inflates per-request
+latency. The default of 16 in flight saturates the allowance in every measured regime; see
+`PROJECT.md` for the measurements.
 
 ### Budget governor
 
