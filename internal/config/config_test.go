@@ -39,8 +39,8 @@ func TestLoadDefaults(t *testing.T) {
 	if c.FetchRPS != 70 {
 		t.Errorf("FetchRPS = %v, want 70", c.FetchRPS)
 	}
-	if c.FetchConcurrency != 64 {
-		t.Errorf("FetchConcurrency = %d, want 64", c.FetchConcurrency)
+	if c.FetchConcurrency != 16 {
+		t.Errorf("FetchConcurrency = %d, want 16", c.FetchConcurrency)
 	}
 	if c.CompatibilityDate != "2026-08-04" {
 		t.Errorf("CompatibilityDate = %q, want 2026-08-04", c.CompatibilityDate)

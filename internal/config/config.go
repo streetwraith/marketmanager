@@ -29,6 +29,12 @@ type Config struct {
 	// FetchRPS is the politeness contract with ESI and binds where latency is low.
 	// FetchConcurrency binds where it is high, since throughput is roughly
 	// concurrency/latency. Whichever binds first, binds.
+	//
+	// ESI grants each source IP a throughput allowance and queues everything
+	// offered above it, so in-flight requests above the allowance only inflate
+	// per-request latency (measured: p50 187ms at 8 in flight, 1875ms at 64, same
+	// req/s). The default of 16 saturates the allowance in every measured regime
+	// while keeping latency far from ESIRequestTimeout. See PROJECT.md.
 	FetchRPS         float64
 	FetchConcurrency int
 
@@ -94,7 +100,7 @@ func Load() (Config, error) {
 	if c.FetchRPS, err = envFloat("FETCH_RPS", 70); err != nil {
 		return Config{}, err
 	}
-	if c.FetchConcurrency, err = envInt("FETCH_CONCURRENCY", 64); err != nil {
+	if c.FetchConcurrency, err = envInt("FETCH_CONCURRENCY", 16); err != nil {
 		return Config{}, err
 	}
 	if c.BudgetReserve, err = envInt("BUDGET_RESERVE", 600); err != nil {
