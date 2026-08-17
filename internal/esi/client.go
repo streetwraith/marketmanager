@@ -31,6 +31,7 @@ type Client struct {
 
 	Budget     *Budget
 	ErrorLimit *ErrorLimit
+	Outage     *Outage
 }
 
 type Options struct {
@@ -81,6 +82,7 @@ func New(o Options) *Client {
 		sem:        make(chan struct{}, o.Concurrency),
 		Budget:     &Budget{},
 		ErrorLimit: &ErrorLimit{},
+		Outage:     &Outage{},
 	}
 }
 
@@ -159,8 +161,10 @@ func (c *Client) get(ctx context.Context, path string) (*response, error) {
 		if he.Status == StatusErrorLimited {
 			c.ErrorLimit.Block(he.ErrorLimitReset)
 		}
+		c.Outage.Observe(he.Status, he.RetryAfter)
 		return r, he
 	}
+	c.Outage.Observe(r.Status, 0)
 	return r, nil
 }
 

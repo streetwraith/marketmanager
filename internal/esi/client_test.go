@@ -200,3 +200,39 @@ func TestTokenCost(t *testing.T) {
 		}
 	}
 }
+
+// The gate has to arm from real responses, not only from direct calls to Observe.
+func TestClientArmsTheOutageGateOn5xx(t *testing.T) {
+	var n atomic.Int32
+	c := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if n.Add(1) <= 2 {
+			w.Header().Set("Retry-After", "30")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("X-Pages", "1")
+		_, _ = w.Write([]byte(`[]`))
+	}))
+
+	if _, err := c.OrdersPage(context.Background(), 10000002, 1); err == nil {
+		t.Fatal("first 503 returned no error")
+	}
+	if d := c.Outage.PausedFor(); d != 0 {
+		t.Errorf("PausedFor() = %v after one 503, want 0", d)
+	}
+
+	if _, err := c.OrdersPage(context.Background(), 10000002, 1); err == nil {
+		t.Fatal("second 503 returned no error")
+	}
+	d := c.Outage.PausedFor()
+	if d <= 0 || d > 30*time.Second {
+		t.Errorf("PausedFor() = %v after two 503s, want at most the 30s Retry-After", d)
+	}
+
+	if _, err := c.OrdersPage(context.Background(), 10000002, 1); err != nil {
+		t.Fatalf("probe after recovery: %v", err)
+	}
+	if d := c.Outage.PausedFor(); d != 0 {
+		t.Errorf("PausedFor() = %v after the upstream answered, want 0", d)
+	}
+}

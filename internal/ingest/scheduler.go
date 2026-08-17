@@ -139,6 +139,10 @@ func (s *Scheduler) pass(ctx context.Context) {
 		sleep(ctx, d)
 		return
 	}
+	if d := s.client.Outage.PausedFor(); d > 0 {
+		s.outage(ctx, d)
+		return
+	}
 	if s.client.Budget.BelowFloor(s.cfg.BudgetFloor) {
 		s.canary(ctx)
 		return
@@ -146,6 +150,12 @@ func (s *Scheduler) pass(ctx context.Context) {
 
 	for _, r := range s.regions {
 		if ctx.Err() != nil {
+			return
+		}
+		// The gate can arm part way through a pass, and every region tends to fall
+		// due in the same band. Without this the onset of an outage still spends
+		// one strike per remaining region before the next tick notices.
+		if s.client.Outage.PausedFor() > 0 {
 			return
 		}
 		due, ok := s.due[r.ID]
@@ -211,11 +221,10 @@ func (s *Scheduler) runRegion(ctx context.Context, r region.Region) {
 		}
 
 		last := attempt == attempts
-		if last || !s.client.ErrorLimit.Healthy(s.cfg.ErrorLimitFloor) {
+		blocked := retriesBlocked(s.client, s.cfg.ErrorLimitFloor)
+		if last || blocked != "" {
 			if !last {
-				// Retrying now risks a 420, which would block every application
-				// sharing this IP, not just this one.
-				s.log.Warn("retries suspended, error budget low", "region", r.Name)
+				s.log.Warn("retries suspended", "reason", blocked, "region", r.Name)
 			}
 			if ctx.Err() != nil {
 				return // shutting down; not a failure
@@ -253,10 +262,38 @@ func (s *Scheduler) canary(ctx context.Context) {
 	s.log.Error("rate limit reached, fetching paused",
 		"remaining", rem, "floor", s.cfg.BudgetFloor,
 		"probe_interval_s", int(s.cfg.CanaryInterval.Seconds()))
-	if _, err := s.client.OrdersPage(ctx, region.GlobalPLEX, 1); err != nil && ctx.Err() == nil {
-		s.log.Warn("canary failed", "err", err)
+	// A successful probe does not mean the budget recovered, so always wait.
+	s.probe(ctx)
+	sleep(ctx, s.cfg.CanaryInterval)
+}
+
+// outage waits out an upstream 5xx spell, probing for the end of it.
+//
+// The probe is the same single cheap request the budget canary uses. It replaces
+// one strike per region per cycle with one strike per interval, which is what
+// keeps a maintenance from tripping the 420 that blocks the whole IP.
+func (s *Scheduler) outage(ctx context.Context, d time.Duration) {
+	s.log.Error("upstream 5xx, fetching paused",
+		"resumes_in_s", int(d.Seconds()),
+		"probe_interval_s", int(s.cfg.CanaryInterval.Seconds()))
+	if s.probe(ctx) {
+		// The probe already cleared the pause, so the next tick runs every region
+		// that is due. Waiting here would throw away that freshness.
+		s.log.Info("upstream recovered, fetching resumes")
+		return
 	}
 	sleep(ctx, s.cfg.CanaryInterval)
+}
+
+// probe makes the one request that tests whether ESI answers.
+func (s *Scheduler) probe(ctx context.Context) bool {
+	if _, err := s.client.OrdersPage(ctx, region.GlobalPLEX, 1); err != nil {
+		if ctx.Err() == nil {
+			s.log.Warn("canary failed", "err", err)
+		}
+		return false
+	}
+	return true
 }
 
 func retryAfter(err error) time.Duration {

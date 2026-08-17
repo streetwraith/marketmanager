@@ -363,3 +363,112 @@ func TestDeferredWaitsForTheNextSnapshot(t *testing.T) {
 		}
 	})
 }
+
+// An upstream maintenance answers 5xx on every route. Fetching on must stop for
+// every region, not only for the one that met the failure.
+func TestOutagePausesEveryRegion(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		fc := &fakeCycle{}
+		s := testScheduler(t, fc, []region.Region{rDomain, rForge})
+		for _, r := range []region.Region{rDomain, rForge} {
+			s.due[r.ID] = time.Now().Add(-time.Second)
+		}
+		s.client.Outage.Observe(503, 0)
+		s.client.Outage.Observe(503, 0)
+
+		s.pass(context.Background())
+
+		if got := len(fc.order()); got != 0 {
+			t.Errorf("ran %d cycles during an upstream outage, want 0", got)
+		}
+	})
+}
+
+// While paused, one probe per interval replaces one strike per region per cycle.
+// That ratio is what keeps a maintenance from tripping the shared 420.
+func TestOutageProbesOnceAndResumesOnRecovery(t *testing.T) {
+	var probes atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		probes.Add(1)
+		w.Header().Set("X-Pages", "1")
+		_, _ = w.Write([]byte(`[]`))
+	}))
+	t.Cleanup(srv.Close)
+
+	client := esi.New(esi.Options{BaseURL: srv.URL, UserAgent: "t",
+		CompatibilityDate: "d", ConnectTimeout: 5 * time.Second, RequestTimeout: 30 * time.Second, RPS: 1000, Concurrency: 4})
+	fc := &fakeCycle{}
+	regions := []region.Region{rDomain, rForge}
+	s := NewScheduler(fc, client, regions, SchedulerConfig{
+		MaxJitter: 0, CanaryInterval: time.Second, MaxAttempts: 3,
+		ErrorLimitFloor: 30, BudgetFloor: 300,
+	}, discardLogger())
+	for _, r := range regions {
+		s.due[r.ID] = time.Now().Add(-time.Second)
+	}
+	client.Outage.Observe(503, 0)
+	client.Outage.Observe(503, 0)
+
+	// The paused pass spends exactly one request, and no region cycle.
+	s.pass(context.Background())
+	if got := probes.Load(); got != 1 {
+		t.Errorf("made %d requests while paused, want exactly 1 probe", got)
+	}
+	if got := len(fc.order()); got != 0 {
+		t.Errorf("ran %d cycles while paused, want 0", got)
+	}
+
+	// The probe succeeded, so the pause is over and the next pass fetches at once
+	// rather than sitting out the rest of the minute.
+	if d := client.Outage.PausedFor(); d != 0 {
+		t.Fatalf("still paused for %v after a successful probe", d)
+	}
+	s.pass(context.Background())
+	if got := len(fc.order()); got != len(regions) {
+		t.Errorf("ran %d cycles after recovery, want %d", got, len(regions))
+	}
+}
+
+// A region already in flight when the outage arms must not keep retrying: those
+// retries strike the same shared error limit the pause exists to protect.
+func TestOutageSuspendsRetries(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		fc := &fakeCycle{result: func(r region.Region, _ int) (Result, error) {
+			return Result{Region: r, Outcome: OutcomeFailed}, fmt.Errorf("esi: http 503")
+		}}
+		s := testScheduler(t, fc, []region.Region{rDomain})
+		s.client.Outage.Observe(503, 0)
+		s.client.Outage.Observe(503, 0)
+
+		s.runRegion(context.Background(), rDomain)
+
+		// rDomain is priority 1 and would normally take all three attempts.
+		if got := fc.callsFor(rDomain.ID); got != 1 {
+			t.Errorf("attempts = %d during an outage, want 1", got)
+		}
+	})
+}
+
+// The gate can arm part way through a pass. Every region falls due in the same
+// band, so the remaining ones must not each spend a strike before the next tick.
+func TestOutageStopsThePassPartWayThrough(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		regions := []region.Region{rDomain, rForge, rSinq}
+		fc := &fakeCycle{}
+		s := testScheduler(t, fc, regions)
+		fc.result = func(r region.Region, _ int) (Result, error) {
+			s.client.Outage.Observe(503, 0)
+			s.client.Outage.Observe(503, 0)
+			return Result{Region: r, Outcome: OutcomeFailed}, fmt.Errorf("esi: http 503")
+		}
+		for _, r := range regions {
+			s.due[r.ID] = time.Now().Add(-time.Second)
+		}
+
+		s.pass(context.Background())
+
+		if got := len(fc.order()); got != 1 {
+			t.Errorf("ran %d cycles, want 1: the pass must stop when the gate arms", got)
+		}
+	})
+}

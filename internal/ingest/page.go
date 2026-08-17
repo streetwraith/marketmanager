@@ -38,6 +38,21 @@ func retryablePage(err error) bool {
 	return errors.As(err, &ne)
 }
 
+// retriesBlocked reports why no retry may run right now, or an empty string.
+//
+// Retrying into a low error budget is how a bad spell becomes a 420 that blocks
+// every application sharing this IP. A retry into an upstream that is already
+// down spends the same strikes for nothing.
+func retriesBlocked(c *esi.Client, errorLimitFloor int) string {
+	if c.Outage.PausedFor() > 0 {
+		return "upstream outage"
+	}
+	if !c.ErrorLimit.Healthy(errorLimitFloor) {
+		return "error budget low"
+	}
+	return ""
+}
+
 // pageBackoff is deliberately short. A sweep has to finish inside the 300s
 // snapshot window or the Last-Modified check will reject it, so a page retry
 // competes with the deadline that makes the whole sweep worth doing.
@@ -76,9 +91,7 @@ func (f *Fetcher) fetchPage(ctx context.Context, r region.Region, page int) (*es
 		if !retryablePage(err) || attempt == f.pageAttempts || ctx.Err() != nil {
 			break
 		}
-		// Retrying into a low error budget is how a bad spell becomes a 420 that
-		// blocks every application sharing this IP.
-		if !f.client.ErrorLimit.Healthy(f.errorLimitFloor) {
+		if retriesBlocked(f.client, f.errorLimitFloor) != "" {
 			break
 		}
 		if !sleep(ctx, f.pageBackoff(attempt, err)) {

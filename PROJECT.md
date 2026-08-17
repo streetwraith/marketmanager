@@ -187,6 +187,30 @@ so server errors are cheap to retry against the budget and expensive against the
 is why retries stop at `ERROR_LIMIT_FLOOR`: retrying into a bad spell is exactly how a 420 happens,
 and a 420 blocks every other application sharing the address, not just this one.
 
+### An upstream outage pauses every region
+
+`ERROR_LIMIT_FLOOR` guards retries, but it does not guard the first attempt of each cycle. During an
+upstream maintenance every route answers 5xx, so each region still spends at least one strike per
+cycle, and a failed region is re-queued 30s later. The maintenance on 2026-08-17 produced about **40
+failed cycles per minute for 50 minutes**, against a limit of 100 errors per minute. The floor could
+not help, because a 5xx that arrives without the `X-ESI-Error-Limit-*` headers leaves the budget
+unknown, and an unknown budget counts as healthy.
+
+The `Outage` gate closes that hole. The client watches the status of every response. Two 5xx in a
+row arm a pause; any response below 500 clears it at once. The scheduler checks the gate before each
+pass, exactly as it checks the 420 block, so one region's failure stops all of them. It checks again
+between regions inside the pass: every region falls due in the same band, so a gate that armed part
+way through a pass would otherwise still cost one strike for each region left in it.
+
+Two 5xx rather than one: a single 5xx is one bad node, and pausing 25 regions for it costs more
+freshness than the strikes it saves. The pause lasts for `Retry-After` when the response carries it,
+otherwise one minute.
+
+While paused, recovery is tested by the same single cheap probe the budget canary uses, once per
+canary interval (25s). One strike per interval replaces one per region per cycle: about 2 errors a
+minute where 2026-08-17 saw about 40. A probe that succeeds clears the pause immediately, so
+ingestion resumes on the next tick rather than waiting out the remaining pause.
+
 ### Sharing the address with other applications
 
 Unauthenticated ESI routes key on source IP, and ESI publishes no AAAA records, so one host means
@@ -342,7 +366,8 @@ exactly the peak hours when ESI is least able to serve them.
 Retryable: timeouts, connection errors, 5xx, and 429 (honouring `Retry-After`). Not retryable: any
 other 4xx, which will fail identically, and 420, which blocks the whole IP until the error window
 resets. Retries also stop while the legacy error budget is below `ERROR_LIMIT_FLOOR`, because
-retrying into a bad spell is how it becomes a 420.
+retrying into a bad spell is how it becomes a 420, and while the outage gate is armed, because a
+retry into an upstream that is already down spends the same strikes for nothing.
 
 Backoff is short by design. A sweep must finish inside the 300s snapshot window or the
 `Last-Modified` check rejects it, so a page retry competes with the deadline that makes the sweep

@@ -52,7 +52,7 @@ func (f *flakyESI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		"duration":90,"range":"region","issued":"2026-06-12T14:58:08Z"}]`))
 }
 
-func flakyFetcher(t *testing.T, f *flakyESI, attempts int) *Fetcher {
+func flakyFetcher(t *testing.T, f *flakyESI) *Fetcher {
 	t.Helper()
 	srv := httptest.NewServer(f)
 	t.Cleanup(srv.Close)
@@ -60,7 +60,7 @@ func flakyFetcher(t *testing.T, f *flakyESI, attempts int) *Fetcher {
 		ConnectTimeout: 5 * time.Second, RequestTimeout: 30 * time.Second,
 		RPS: 5000, Concurrency: 8})
 	return NewFetcher(c, FetcherConfig{
-		Reserve: 600, BudgetFloor: 300, PageAttempts: attempts,
+		Reserve: 600, BudgetFloor: 300, PageAttempts: 3,
 		ErrorLimitFloor: 30, PageBackoffUnit: time.Millisecond,
 	})
 }
@@ -81,9 +81,13 @@ func runSweep(t *testing.T, f *Fetcher) (*SweepMeta, error) {
 
 // The point of the change: one transient page failure must not discard the whole
 // sweep. Before, a single 503 on page 7 of 413 cost the entire region.
+//
+// The page fails exactly once. A second 5xx in a row would arm the outage gate,
+// which suspends retries by design, and whether it lands in a row depends on how
+// the other pages interleave.
 func TestSweepRetriesASinglePageInsteadOfFailing(t *testing.T) {
-	fake := &flakyESI{pages: 10, failPage: 7, failTimes: 2, status: http.StatusServiceUnavailable}
-	meta, err := runSweep(t, flakyFetcher(t, fake, 3))
+	fake := &flakyESI{pages: 10, failPage: 7, failTimes: 1, status: http.StatusServiceUnavailable}
+	meta, err := runSweep(t, flakyFetcher(t, fake))
 	if err != nil {
 		t.Fatalf("sweep failed despite a retryable page: %v", err)
 	}
@@ -92,8 +96,8 @@ func TestSweepRetriesASinglePageInsteadOfFailing(t *testing.T) {
 	}
 	fake.mu.Lock()
 	defer fake.mu.Unlock()
-	if got := fake.attempts[7]; got != 3 {
-		t.Errorf("page 7 attempted %d times, want 3 (2 failures then success)", got)
+	if got := fake.attempts[7]; got != 2 {
+		t.Errorf("page 7 attempted %d times, want 2 (one failure then success)", got)
 	}
 	// Only the failing page is refetched; the other nine are fetched once.
 	for p := 1; p <= 10; p++ {
@@ -104,16 +108,19 @@ func TestSweepRetriesASinglePageInsteadOfFailing(t *testing.T) {
 			t.Errorf("page %d attempted %d times, want 1", p, got)
 		}
 	}
-	// 5xx costs 0 tokens, so the two failures are free; 10 successes at 2 each.
+	// 5xx costs 0 tokens, so the failure is free; 10 successes at 2 each.
 	if meta.TokensSpent != 20 {
 		t.Errorf("TokensSpent = %d, want 20", meta.TokensSpent)
 	}
 }
 
 // Retries are bounded: a page that never recovers still fails the sweep.
+//
+// The page answers 429 rather than 5xx to keep this about the retry bound alone.
+// A repeated 5xx arms the outage gate, which stops retrying for its own reason.
 func TestSweepGivesUpAfterPageAttempts(t *testing.T) {
-	fake := &flakyESI{pages: 6, failPage: 3, failTimes: 99, status: http.StatusServiceUnavailable}
-	_, err := runSweep(t, flakyFetcher(t, fake, 3))
+	fake := &flakyESI{pages: 6, failPage: 3, failTimes: 99, status: http.StatusTooManyRequests}
+	_, err := runSweep(t, flakyFetcher(t, fake))
 	if err == nil {
 		t.Fatal("expected the sweep to fail when a page never recovers")
 	}
@@ -127,7 +134,7 @@ func TestSweepGivesUpAfterPageAttempts(t *testing.T) {
 // A 4xx will fail identically next time, so retrying it only wastes 5 tokens a go.
 func TestSweepDoesNotRetryClientErrors(t *testing.T) {
 	fake := &flakyESI{pages: 6, failPage: 4, failTimes: 99, status: http.StatusNotFound}
-	_, err := runSweep(t, flakyFetcher(t, fake, 3))
+	_, err := runSweep(t, flakyFetcher(t, fake))
 	if err == nil {
 		t.Fatal("expected the sweep to fail on a 404")
 	}
@@ -159,5 +166,26 @@ func TestRetryablePage(t *testing.T) {
 				t.Errorf("retryablePage(%v) = %v, want %v", tc.err, got, tc.want)
 			}
 		})
+	}
+}
+
+// While the outage gate is armed, a page must not be retried: those retries strike
+// the shared error limit that the pause exists to protect.
+//
+// Page 1 fails, which ends the sweep before any other page is requested, so no
+// success can clear the gate and the attempt count is deterministic.
+func TestSweepDoesNotRetryWhileTheOutageGateIsArmed(t *testing.T) {
+	fake := &flakyESI{pages: 6, failPage: 1, failTimes: 99, status: http.StatusServiceUnavailable}
+	f := flakyFetcher(t, fake)
+	f.client.Outage.Observe(503, 0)
+	f.client.Outage.Observe(503, 0)
+
+	if _, err := runSweep(t, f); err == nil {
+		t.Fatal("expected the sweep to fail while the upstream is down")
+	}
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if got := fake.attempts[1]; got != 1 {
+		t.Errorf("page 1 attempted %d times with the gate armed, want 1", got)
 	}
 }
