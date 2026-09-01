@@ -224,7 +224,11 @@ func (c *Cycle) recordFailure(ctx context.Context, r region.Region, err error,
 	// A shutdown is not a fault. Recording one would leave a spurious error on the
 	// region the consumer watches, and the write would fail anyway because it
 	// shares the cancelled context.
-	if errors.Is(err, context.Canceled) || ctx.Err() != nil {
+	//
+	// Only the parent context decides that; never the error. A copy failure cancels
+	// the in-flight sweep, so a live fault also carries context.Canceled. PROJECT.md
+	// records what testing the error instead used to hide.
+	if ctx.Err() != nil {
 		res.Outcome = OutcomeFailed
 		c.log.Debug("cycle interrupted by shutdown", "region", r.Name)
 		return

@@ -9,6 +9,8 @@ package ingest
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"log/slog"
 	"os"
 	"testing"
@@ -179,5 +181,57 @@ func TestLiveCycleResyncsOnDrift(t *testing.T) {
 	}
 	if live.Rows == 0 {
 		t.Error("region is empty after the repair")
+	}
+}
+
+// A database failure during the copy cancels the in-flight sweep, so the joined
+// cause carries context.Canceled while the service is running normally. That is
+// a fault, not a shutdown: it must set res.Err, mark the region, and write an
+// ingest_log row, or the scheduler treats the cycle as a success and nothing
+// ever reports the broken database.
+func TestLiveCopyFailureIsNotAShutdown(t *testing.T) {
+	cyc, st, _ := liveCycle(t)
+	ctx := context.Background()
+
+	// No region_status row exists for this id, so MarkFailed touches nothing real.
+	const scratchRegion = 99999999
+	r := region.Region{ID: scratchRegion, Name: "scratch", Priority: region.Rest}
+	cause := errors.Join(
+		fmt.Errorf("region %d page 7: %w", r.ID, context.Canceled),
+		errors.New("copy orders: connection lost"),
+	)
+
+	res := Result{Region: r, Outcome: OutcomeFailed}
+	entry := store.IngestLogEntry{RegionID: r.ID, CycleStartedAt: time.Now()}
+	cyc.recordFailure(ctx, r, cause, &res, &entry)
+
+	if res.Err == nil {
+		t.Error("res.Err is nil; the scheduler would read this cycle as a success")
+	}
+	if res.Outcome != OutcomeFailed {
+		t.Errorf("outcome = %q, want %q", res.Outcome, OutcomeFailed)
+	}
+
+	var logged int
+	if err := st.Pool().QueryRow(ctx,
+		`SELECT count(*) FROM `+store.Schema+`.ingest_log WHERE region_id = $1`,
+		scratchRegion).Scan(&logged); err != nil {
+		t.Fatalf("count ingest_log: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = st.Pool().Exec(context.Background(),
+			`DELETE FROM `+store.Schema+`.ingest_log WHERE region_id = $1`, scratchRegion)
+	})
+	if logged != 1 {
+		t.Errorf("ingest_log rows = %d, want 1", logged)
+	}
+
+	// A real shutdown still stays quiet.
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	quiet := Result{Region: r, Outcome: OutcomeFailed}
+	cyc.recordFailure(cancelled, r, cause, &quiet, &entry)
+	if quiet.Err != nil {
+		t.Errorf("a cancelled parent context reported %v, want nil", quiet.Err)
 	}
 }
