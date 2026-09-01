@@ -1,10 +1,15 @@
 package main
 
 import (
+	"bytes"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"testing"
+
+	"marketmanager/internal/sentrytest"
 )
 
 // healthProbe is what the container HEALTHCHECK runs: the distroless image has
@@ -77,5 +82,89 @@ func TestHealthProbeFailsOnNon200(t *testing.T) {
 	t.Setenv("HTTP_ADDR", ":"+u.Port())
 	if got := healthProbe(); got != 1 {
 		t.Errorf("healthProbe() = %d against a 503, want 1", got)
+	}
+}
+
+// capturePanic has two halves: report the panic, and let it carry on killing the
+// process. Swallowing it would leave a dead goroutine behind a /healthz that
+// still passes, because the check only pings Postgres.
+func TestCapturePanicReportsAndRepanics(t *testing.T) {
+	sink := sentrytest.Capture(t)
+
+	var escaped any
+	func() {
+		defer func() { escaped = recover() }()
+		defer capturePanic("history")
+		panic("history importer exploded")
+	}()
+
+	if escaped == nil {
+		t.Fatal("capturePanic swallowed the panic; the process must still die")
+	}
+	events := sink.Captured()
+	if len(events) != 1 {
+		t.Fatalf("events = %d, want 1", len(events))
+	}
+	if events[0].Tags["component"] != "history" {
+		t.Errorf("event tags = %v, want component=history", events[0].Tags)
+	}
+}
+
+// A goroutine that returns normally must report nothing.
+func TestCapturePanicIsQuietWithoutAPanic(t *testing.T) {
+	sink := sentrytest.Capture(t)
+	func() { defer capturePanic("scheduler") }()
+	if got := len(sink.Captured()); got != 0 {
+		t.Fatalf("events = %d, want 0", got)
+	}
+}
+
+// A release that never changes looks valid and silently makes every regression
+// undetectable, which is worse than sending none at all.
+func TestSentryRelease(t *testing.T) {
+	tests := []struct {
+		name   string
+		commit string
+		want   string
+	}{
+		{"a git-built container carries the real SHA", "c6f6815", "c6f6815"},
+		{"a Docker-image app carries the literal HEAD", "HEAD", ""},
+		{"an unset variable leaves the release empty", "", ""},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("SOURCE_COMMIT", tc.commit)
+			if got := sentryRelease(); got != tc.want {
+				t.Errorf("sentryRelease() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// A DSN is a write credential for the error store, and sentry quotes the whole
+// DSN back inside its own parse error. Logging that error would put the
+// credential in stdout, where anyone with container log access can read it and
+// then forge or flood events to bury a real incident.
+func TestSentryInitNeverLogsTheDsn(t *testing.T) {
+	const marker = "UNIQUE_DSN_MARKER_d41d8cd9"
+	// The control character makes url.Parse reject the DSN, so Init returns the
+	// error that quotes it. Init binds no client when it fails, so the global hub
+	// is left alone.
+	t.Setenv("BUGSINK_DSN", "https://"+marker+"@errors.example.invalid/\x7f1")
+
+	var logs bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	initSentry()
+
+	// Without this the test would still pass if the failure branch stopped
+	// logging, or stopped being reached at all.
+	if !strings.Contains(logs.String(), "sentry init failed") {
+		t.Fatalf("the init failure was not logged; got %q", logs.String())
+	}
+	if strings.Contains(logs.String(), marker) {
+		t.Errorf("the DSN reached the log: %s", logs.String())
 	}
 }

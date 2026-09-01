@@ -12,6 +12,7 @@ internal/region/       which regions to ingest, and in what order
 internal/esi/          the ESI client, rate limiting, and the budget governor
 internal/everef/       the EVE Ref daily history dataset client and parser
 internal/ingest/       the sweep, the delta cycle, the scheduler, history, maintenance
+internal/sentrytest/   a sentry transport that records events, for tests only
 migrations/            embedded SQL, applied at start under an advisory lock
 ```
 
@@ -532,6 +533,75 @@ is covered under "Maintenance".
    reason never to make a live partition UNLOGGED. PostgreSQL 18 disallows UNLOGGED *partitioned*
    tables, meaning the parent only; individual UNLOGGED partitions stay legal, so this design
    survives that upgrade.
+
+## Error reporting (Bugsink)
+
+Errors go to a self-hosted Bugsink instance, which is compatible with the Sentry SDK, through
+`github.com/getsentry/sentry-go` at a pinned version. `BUGSINK_DSN` turns it on; an empty DSN
+makes every SDK call a no-op, so local runs and CI stay silent with no extra settings. The SDK
+starts in `main` **before** `config.Load`, so a missing `DATABASE_URL` still produces an event.
+`BUGSINK_DSN` therefore bypasses `internal/config` on purpose. Bugsink holds error events only,
+so tracing is off.
+
+`AttachStacktrace` is on because almost every error here comes from `fmt.Errorf` and carries no
+stack of its own. The release comes from `SOURCE_COMMIT`, which Coolify injects into a git-built
+container. The literal string `HEAD`, which a Docker-image app gets instead, is mapped to empty:
+a release that never changes looks valid and quietly makes every regression undetectable.
+
+The service has no request path and no logging hook, so every event comes from an explicit
+capture. What reports, and what deliberately does not:
+
+| Fault | Reports? | Tags |
+|---|---|---|
+| `run` returns an error (bad config, DB down, migration, region resolve) | yes, then exit 1 | `component=fatal` |
+| A panic in the main, scheduler, maintenance or history goroutine | yes, then re-panic so the process still dies | `component=` the goroutine |
+| A region cycle exhausts its retries | **first failure of a run only**, per region | `component=scheduler`, `region=` |
+| The legacy per-IP error limit trips (420) | **once per trip** | `component=scheduler` |
+| Prune or analyze fails | **first failure of a run only**, per job | `component=maintenance`, `job=` |
+| The EVE Ref poll, its bookkeeping read, or a day import fails | **first failure of a run only**, per site | `component=history`, `job=` |
+| A region deferral (the budget governor refusing a region) | no — the governor working as designed | |
+| The budget floor pause, and the 5xx outage pause | no — this service backing off; both clear in minutes | |
+| A prime failure | no — it retries in 30s, and then reports through the region path | |
+| A day file that EVE Ref has not published yet (404) | no — normal operation | |
+| A repaired checksum drift, duplicate order ids, a failed bookkeeping write | no — these stay WARN, per the logging rules above | |
+| A cancelled **parent** context | no — that is a shutdown | |
+
+**Only the parent context means a shutdown.** An error that merely wraps `context.Canceled` does
+not. A database failure during the copy cancels the in-flight sweep, so the joined cause carries
+`context.Canceled` while the service runs on. `recordFailure` therefore tests `ctx.Err()` and never
+the error. Testing the error instead classified every such failure as a shutdown: it skipped
+`MarkFailed` and `LogIngest`, left `res.Err` nil, and made the scheduler log the region as
+refreshed — so a Postgres incident looked healthy while the data went stale.
+`TestLiveCopyFailureIsNotAShutdown` holds that line.
+
+**Why the runs of failures.** A ticker is the retry here. The scheduler ticks every second, and
+every region turns fresh inside the same ~60 second band, so an unguarded capture would turn one
+upstream problem into an event per region per tick. Each site therefore reports the first failure
+and stays quiet until that job succeeds again. `internal/ingest/streak.go` holds the whole
+mechanism; the scheduler keys it by region, and maintenance and history key it by job.
+
+**Why the error limit is the exception.** The budget floor and the 5xx pause are this service
+backing off from its own upstream, and both clear in minutes. The legacy error limit is counted
+per **source IP**, so tripping it returns 420 to every other application on this host, including
+authenticated calls this service knows nothing about. That needs a person.
+
+`capturePanic` re-panics on purpose. `sentry.Recover` swallows the panic instead, which would
+leave a dead goroutine behind a `/healthz` that still passes, because the check only pings
+Postgres. The two HTTP goroutines carry no guard, because neither can deliver a panic to one:
+`net/http` recovers a panic inside a handler itself, and the bodies of those goroutines are only
+`ListenAndServe` and `Shutdown`. The `/healthz` handler does nothing but ping the database.
+
+One gap is deliberate. `Maintenance` and `HistoryImporter` hold a concrete `*store.Store` and
+`*everef.Client`, so their `ctx.Err() == nil` shutdown gates are covered only by the
+`integration`-tagged tests. The capture helpers themselves are unit-tested. Closing the gap needs
+two interface seams, and the fault it would catch is a spurious event during shutdown: noise, not
+a missed failure.
+
+Two credentials stay out. `pgconn` redacts the Postgres password in a parse error and never
+includes it in a connect error, so no `BeforeSend` scrubber is needed. A DSN is a write credential
+for the error store, and sentry quotes the whole DSN inside its own parse error, so the init
+failure is logged without that error; `TestSentryInitNeverLogsTheDsn` holds that line. Response
+bodies never reach an event either, for the reason given under Logging.
 
 ## Deliberately absent
 

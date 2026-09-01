@@ -2,6 +2,7 @@ package ingest
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -16,6 +17,7 @@ import (
 
 	"marketmanager/internal/esi"
 	"marketmanager/internal/region"
+	"marketmanager/internal/sentrytest"
 )
 
 func discardLogger() *slog.Logger {
@@ -469,6 +471,175 @@ func TestOutageStopsThePassPartWayThrough(t *testing.T) {
 
 		if got := len(fc.order()); got != 1 {
 			t.Errorf("ran %d cycles, want 1: the pass must stop when the gate arms", got)
+		}
+	})
+}
+
+// One upstream problem hits every region inside the same due band, and the loop
+// ticks each second. Without the streak that is hundreds of events per outage.
+func TestSchedulerReportsOnceForARegionOutage(t *testing.T) {
+	sink := sentrytest.Capture(t)
+	synctest.Test(t, func(t *testing.T) {
+		fc := &fakeCycle{result: func(r region.Region, _ int) (Result, error) {
+			return Result{Region: r, Outcome: OutcomeFailed}, fmt.Errorf("esi unreachable")
+		}}
+		s := testScheduler(t, fc, []region.Region{rDomain})
+
+		s.runRegion(context.Background(), rDomain)
+		s.runRegion(context.Background(), rDomain)
+		if got := len(sink.Captured()); got != 1 {
+			t.Fatalf("events after two failing cycles = %d, want 1", got)
+		}
+
+		// One success ends the run, so the next outage is a new fault.
+		fc.result = func(r region.Region, _ int) (Result, error) {
+			return Result{Region: r, Outcome: OutcomeOK,
+				Meta: SweepMeta{Expires: time.Now().Add(5 * time.Minute)}}, nil
+		}
+		s.runRegion(context.Background(), rDomain)
+		fc.result = func(r region.Region, _ int) (Result, error) {
+			return Result{Region: r, Outcome: OutcomeFailed}, fmt.Errorf("esi unreachable")
+		}
+		s.runRegion(context.Background(), rDomain)
+
+		events := sink.Captured()
+		if len(events) != 2 {
+			t.Fatalf("events after a second outage = %d, want 2", len(events))
+		}
+		for i, e := range events {
+			if e.Tags["component"] != "scheduler" || e.Tags["region"] != "Domain" {
+				t.Errorf("event %d tags = %v, want component=scheduler region=Domain", i, e.Tags)
+			}
+		}
+
+		// The context is what an operator reads to decide whether to act.
+		cycle := events[0].Contexts["cycle"]
+		if cycle["region_id"] != rDomain.ID {
+			t.Errorf("region_id = %v, want %d", cycle["region_id"], rDomain.ID)
+		}
+		if cycle["priority"] != rDomain.Priority {
+			t.Errorf("priority = %v, want %d", cycle["priority"], rDomain.Priority)
+		}
+		if cycle["outcome"] != OutcomeFailed {
+			t.Errorf("outcome = %v, want %s", cycle["outcome"], OutcomeFailed)
+		}
+		if cycle["attempts"] != 3 {
+			t.Errorf("attempts = %v, want 3 (Domain retries to the limit)", cycle["attempts"])
+		}
+	})
+}
+
+// Each region reports for itself: a fault confined to one region must not be
+// masked by another region's open run.
+func TestSchedulerTracksEachRegionSeparately(t *testing.T) {
+	sink := sentrytest.Capture(t)
+	synctest.Test(t, func(t *testing.T) {
+		fc := &fakeCycle{result: func(r region.Region, _ int) (Result, error) {
+			return Result{Region: r, Outcome: OutcomeFailed}, fmt.Errorf("esi unreachable")
+		}}
+		s := testScheduler(t, fc, []region.Region{rDomain, rForge})
+
+		s.runRegion(context.Background(), rDomain)
+		s.runRegion(context.Background(), rForge)
+
+		if got := len(sink.Captured()); got != 2 {
+			t.Fatalf("events = %d, want one per region", got)
+		}
+	})
+}
+
+// The governor refusing a region is the design working. So is a shutdown, which
+// is a cancelled parent context rather than an error that mentions one.
+func TestSchedulerReportsNeitherDeferralNorShutdown(t *testing.T) {
+	sink := sentrytest.Capture(t)
+	synctest.Test(t, func(t *testing.T) {
+		fc := &fakeCycle{result: func(r region.Region, _ int) (Result, error) {
+			return Result{Region: r, Outcome: OutcomeDeferred, Err: &ErrDeferred{Reason: "budget"}}, nil
+		}}
+		s := testScheduler(t, fc, []region.Region{rDomain, rForge})
+		s.runRegion(context.Background(), rDomain)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		fc.result = func(r region.Region, _ int) (Result, error) {
+			return Result{Region: r, Outcome: OutcomeFailed}, errors.New("db down")
+		}
+		s.runRegion(ctx, rForge)
+
+		if got := len(sink.Captured()); got != 0 {
+			t.Fatalf("events = %d, want 0", got)
+		}
+	})
+}
+
+// A cancelled inner context is not a shutdown. A database failure during the
+// copy aborts the in-flight sweep, so the cause wraps context.Canceled while the
+// service itself runs on. That fault is exactly the kind a person must see, so
+// the capture path must never filter on the error alone.
+func TestSchedulerReportsACauseThatWrapsCancellation(t *testing.T) {
+	sink := sentrytest.Capture(t)
+	synctest.Test(t, func(t *testing.T) {
+		cause := errors.Join(
+			fmt.Errorf("region 10000002 page 7: %w", context.Canceled),
+			errors.New("copy orders: connection lost"),
+		)
+		fc := &fakeCycle{result: func(r region.Region, _ int) (Result, error) {
+			return Result{Region: r, Outcome: OutcomeFailed}, cause
+		}}
+		s := testScheduler(t, fc, []region.Region{rDomain})
+		s.runRegion(context.Background(), rDomain)
+
+		if got := len(sink.Captured()); got != 1 {
+			t.Fatalf("events = %d, want 1", got)
+		}
+	})
+}
+
+// The legacy limit is counted per source IP, so tripping it returns 420 to every
+// other application on this host. It reports once per trip, not once per tick.
+func TestSchedulerReportsTheErrorLimitOncePerTrip(t *testing.T) {
+	sink := sentrytest.Capture(t)
+	synctest.Test(t, func(t *testing.T) {
+		ctx := context.Background()
+		s := testScheduler(t, &fakeCycle{}, []region.Region{rDomain})
+
+		s.client.ErrorLimit.Block(45 * time.Second)
+		s.pass(ctx)                        // trips, reports, then sleeps out the block
+		s.noteErrorLimit(40 * time.Second) // a re-entry inside the same trip stays quiet
+		events := sink.Captured()
+		if len(events) != 1 {
+			t.Fatalf("events = %d, want 1", len(events))
+		}
+		if events[0].Tags["component"] != "scheduler" {
+			t.Errorf("tags = %v, want component=scheduler", events[0].Tags)
+		}
+
+		s.pass(ctx) // the block has expired, so the guard clears
+		s.client.ErrorLimit.Block(30 * time.Second)
+		s.pass(ctx) // a new trip is a new fault
+		if got := len(sink.Captured()); got != 2 {
+			t.Fatalf("events after a second trip = %d, want 2", got)
+		}
+	})
+}
+
+// A budget pause and an upstream 5xx are this service backing off from its own
+// upstream. Both clear in minutes and neither needs a person.
+func TestSchedulerReportsNeitherBudgetFloorNorOutage(t *testing.T) {
+	sink := sentrytest.Capture(t)
+	synctest.Test(t, func(t *testing.T) {
+		s := testScheduler(t, &fakeCycle{}, []region.Region{rDomain})
+		s.due[rDomain.ID] = time.Now().Add(-time.Second)
+
+		s.client.Budget.Observe(120) // below the 300 floor
+		s.pass(context.Background())
+
+		s.client.Outage.Observe(503, 0)
+		s.client.Outage.Observe(503, 0)
+		s.pass(context.Background())
+
+		if got := len(sink.Captured()); got != 0 {
+			t.Fatalf("events = %d, want 0", got)
 		}
 	})
 }

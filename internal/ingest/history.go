@@ -7,6 +7,8 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/getsentry/sentry-go"
+
 	"marketmanager/internal/everef"
 	"marketmanager/internal/region"
 	"marketmanager/internal/store"
@@ -34,7 +36,17 @@ type HistoryImporter struct {
 	regions map[int64]bool
 	cfg     HistoryConfig
 	log     *slog.Logger
+
+	// reports keeps one outage to one event per site; see streak.
+	reports streak
 }
+
+// The history failure sites, used in the event tag and as the streak key.
+const (
+	jobTotals      = "totals"
+	jobBookkeeping = "bookkeeping"
+	jobImportDay   = "import-day"
+)
 
 func NewHistoryImporter(c *everef.Client, st *store.Store, regions []region.Region,
 	cfg HistoryConfig, log *slog.Logger) *HistoryImporter {
@@ -73,14 +85,20 @@ func (h *HistoryImporter) once(ctx context.Context) {
 	if err != nil {
 		if ctx.Err() == nil {
 			h.log.Error("poll everef totals", "err", err)
+			h.note(jobTotals, "", err)
 		}
 		return
 	}
+	h.reports.ends(jobTotals)
 	stored, err := h.store.EverefDays(ctx)
 	if err != nil {
-		h.log.Error("load everef bookkeeping", "err", err)
+		if ctx.Err() == nil {
+			h.log.Error("load everef bookkeeping", "err", err)
+			h.note(jobBookkeeping, "", err)
+		}
 		return
 	}
+	h.reports.ends(jobBookkeeping)
 
 	due := h.selectDays(totals, stored)
 	h.log.Debug("history poll", "days_in_index", len(totals), "days_stored", len(stored),
@@ -103,9 +121,11 @@ func (h *HistoryImporter) once(ctx context.Context) {
 			}
 			if ctx.Err() == nil {
 				h.log.Error("import day", "day", day, "err", err)
+				h.note(jobImportDay, day, err)
 			}
 			continue
 		}
+		h.reports.ends(jobImportDay)
 		imported += int(n)
 		files++
 		if !sleep(ctx, h.cfg.Spacing) {
@@ -122,6 +142,25 @@ func (h *HistoryImporter) once(ctx context.Context) {
 			"total_rows", rows, "from", dayStr(minDay), "to", dayStr(maxDay),
 			"total_ms", time.Since(start).Milliseconds())
 	}
+}
+
+// note reports a failed history site, once per run of failures. EVE Ref is a
+// best-effort third party polled every 15 minutes, so a day-long outage there
+// would otherwise send 96 events that all say the same thing.
+// day names the day file a failure concerns, and is empty for a site that does
+// not have one.
+func (h *HistoryImporter) note(job, day string, err error) {
+	if !h.reports.first(job) {
+		return
+	}
+	sentry.WithScope(func(scope *sentry.Scope) {
+		scope.SetTag("component", "history")
+		scope.SetTag("job", job)
+		if day != "" {
+			scope.SetContext("history", sentry.Context{"day": day})
+		}
+		sentry.CaptureException(err)
+	})
 }
 
 // selectDays decides which days to fetch, oldest first.

@@ -6,6 +6,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/getsentry/sentry-go"
+
 	"marketmanager/internal/store"
 )
 
@@ -25,7 +27,16 @@ type Maintenance struct {
 
 	pruneMu   sync.Mutex
 	analyzeMu sync.Mutex
+
+	// reports keeps one broken database to one event per job; see streak.
+	reports streak
 }
+
+// The job names used in the log, in the event tag, and as the streak key.
+const (
+	jobPrune   = "prune"
+	jobAnalyze = "analyze"
+)
 
 func NewMaintenance(st *store.Store, pruneInterval, analyzeInterval time.Duration,
 	retentionDays int, log *slog.Logger) *Maintenance {
@@ -74,9 +85,11 @@ func (m *Maintenance) prune(ctx context.Context) {
 	if err != nil {
 		if ctx.Err() == nil {
 			m.log.Error("prune ingest_log", "err", err)
+			m.note(jobPrune, err)
 		}
 		return
 	}
+	m.reports.ends(jobPrune)
 	m.log.Info("pruned ingest_log", "rows", n, "retention_days", m.retentionDays,
 		"ms", time.Since(start).Milliseconds())
 }
@@ -99,8 +112,24 @@ func (m *Maintenance) analyze(ctx context.Context) {
 	if err := m.store.AnalyzeParents(ctx); err != nil {
 		if ctx.Err() == nil {
 			m.log.Error("analyze parents", "err", err)
+			m.note(jobAnalyze, err)
 		}
 		return
 	}
+	m.reports.ends(jobAnalyze)
 	m.log.Info("analyzed partitioned parents", "ms", time.Since(start).Milliseconds())
+}
+
+// note reports a failed housekeeping job, once per run of failures. Both jobs
+// only ever fail because the database does, and a broken database fails every
+// tick until somebody fixes it.
+func (m *Maintenance) note(job string, err error) {
+	if !m.reports.first(job) {
+		return
+	}
+	sentry.WithScope(func(scope *sentry.Scope) {
+		scope.SetTag("component", "maintenance")
+		scope.SetTag("job", job)
+		sentry.CaptureException(err)
+	})
 }

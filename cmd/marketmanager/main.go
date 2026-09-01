@@ -16,6 +16,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/getsentry/sentry-go"
 	"github.com/joho/godotenv"
 	"golang.org/x/sync/errgroup"
 
@@ -37,16 +38,84 @@ func main() {
 		os.Exit(healthProbe())
 	}
 
+	// The SDK starts before config.Load, so a missing DATABASE_URL still reports.
+	// BUGSINK_DSN therefore bypasses internal/config on purpose.
+	loadEnvFile()
+	initSentry()
+	defer capturePanic("main")
+
 	if err := run(context.Background()); err != nil {
 		slog.Error("fatal", "err", err)
+		// A cancelled context here is a SIGTERM during startup, not a fault.
+		if !errors.Is(err, context.Canceled) {
+			sentry.WithScope(func(scope *sentry.Scope) {
+				scope.SetTag("component", "fatal")
+				sentry.CaptureException(err)
+			})
+		}
+		// os.Exit skips deferred calls, so flush here rather than in a defer.
+		sentry.Flush(sentryFlushTimeout)
 		os.Exit(1)
 	}
+	sentry.Flush(sentryFlushTimeout)
 	slog.Info("shutdown complete")
 }
 
-func run(ctx context.Context) error {
-	loadEnvFile()
+// sentryFlushTimeout bounds the wait for buffered events on the way out.
+const sentryFlushTimeout = 2 * time.Second
 
+// initSentry starts error reporting when BUGSINK_DSN is set. An empty DSN keeps
+// local development and CI silent: every sentry call is then a no-op.
+func initSentry() {
+	dsn := os.Getenv("BUGSINK_DSN")
+	if dsn == "" {
+		return
+	}
+	err := sentry.Init(sentry.ClientOptions{
+		Dsn: dsn,
+		// Our errors come from fmt.Errorf and carry no stack of their own.
+		AttachStacktrace: true,
+		Environment:      "production",
+		Release:          sentryRelease(),
+	})
+	if err != nil {
+		// A DSN that url.Parse rejects is quoted back inside the error, and a DSN
+		// is a write credential. Never let it reach the log.
+		slog.Error("sentry init failed; check BUGSINK_DSN")
+		return
+	}
+	slog.Info("error reporting enabled")
+}
+
+// sentryRelease is the release stamped on an error event. Coolify injects the
+// real commit SHA into a git-built container, and the literal string "HEAD" into
+// a Docker-image one. A constant release is worse than none, because every deploy
+// then looks like the same one and Bugsink can never detect a regression.
+func sentryRelease() string {
+	if release := os.Getenv("SOURCE_COMMIT"); release != "HEAD" {
+		return release
+	}
+	return ""
+}
+
+// capturePanic reports a panic from one of the service's goroutines, then
+// re-panics so the process still dies and Coolify restarts it. sentry.Recover
+// swallows the panic instead, which would leave a dead goroutine behind a
+// /healthz that still passes, because the check only pings Postgres.
+func capturePanic(component string) {
+	r := recover()
+	if r == nil {
+		return
+	}
+	sentry.WithScope(func(scope *sentry.Scope) {
+		scope.SetTag("component", component)
+		sentry.CurrentHub().Recover(r)
+	})
+	sentry.Flush(sentryFlushTimeout)
+	panic(r)
+}
+
+func run(ctx context.Context) error {
 	cfg, err := config.Load()
 	if err != nil {
 		// Configuration is rejected before the level is known, so use the default.
@@ -135,9 +204,9 @@ func run(ctx context.Context) error {
 
 	g, ctx := errgroup.WithContext(ctx)
 
-	g.Go(func() error { return scheduler.Run(ctx) })
-	g.Go(func() error { return maint.Run(ctx) })
-	g.Go(func() error { return history.Run(ctx) })
+	g.Go(func() error { defer capturePanic("scheduler"); return scheduler.Run(ctx) })
+	g.Go(func() error { defer capturePanic("maintenance"); return maint.Run(ctx) })
+	g.Go(func() error { defer capturePanic("history"); return history.Run(ctx) })
 
 	srv := &http.Server{
 		Addr:         cfg.HTTPAddr,

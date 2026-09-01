@@ -116,6 +116,8 @@ start where the data is absent. Pin a smaller value when testing.
 | `INGEST_LOG_RETENTION_DAYS` | `30` | How long to keep `market.ingest_log` rows. |
 | `PRUNE_INTERVAL` | `24h` | How often to trim the ingest log. |
 | `ANALYZE_INTERVAL` | `1h` | How often to `ANALYZE` the partitioned parents. Also runs once at start. |
+| `BUGSINK_DSN` | empty | Error reporting. Empty turns it off, which is what local runs and CI want. |
+| `SOURCE_COMMIT` | empty | Coolify injects the commit SHA. It becomes the release on an error event. |
 
 `debug` adds a line per ESI request and per cycle phase. It is far too chatty for a live service.
 Response bodies are never logged at any level.

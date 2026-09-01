@@ -8,6 +8,8 @@ import (
 	"slices"
 	"time"
 
+	"github.com/getsentry/sentry-go"
+
 	"marketmanager/internal/esi"
 	"marketmanager/internal/region"
 )
@@ -48,7 +50,14 @@ type Scheduler struct {
 	log     *slog.Logger
 
 	due map[int64]time.Time
+	// reports keeps one outage to one event; see streak. Regions are keyed by
+	// name, and the error limit by keyErrorLimit.
+	reports streak
 }
+
+// keyErrorLimit is the streak key for the error-limit event. Every other key
+// here is a region name, and no region is called this.
+const keyErrorLimit = "error-limit"
 
 func NewScheduler(c cycleRunner, client *esi.Client,
 	regions []region.Region, cfg SchedulerConfig, log *slog.Logger) *Scheduler {
@@ -136,9 +145,11 @@ func (s *Scheduler) pass(ctx context.Context) {
 	if d := s.client.ErrorLimit.BlockedFor(); d > 0 {
 		s.log.Error("error limit tripped, all requests paused",
 			"resumes_in_s", int(d.Seconds()))
+		s.noteErrorLimit(d)
 		sleep(ctx, d)
 		return
 	}
+	s.reports.ends(keyErrorLimit)
 	if d := s.client.Outage.PausedFor(); d > 0 {
 		s.outage(ctx, d)
 		return
@@ -181,6 +192,7 @@ func (s *Scheduler) runRegion(ctx context.Context, r region.Region) {
 			return
 		}
 		if err == nil && res.Err == nil {
+			s.reports.ends(r.Name)
 			s.due[r.ID] = s.nextDue(res.Meta.Expires)
 			rem, _ := s.client.Budget.Remaining()
 			s.log.Info("region refreshed",
@@ -208,6 +220,9 @@ func (s *Scheduler) runRegion(ctx context.Context, r region.Region) {
 		// page 1, and nothing can change until the snapshot does: retrying every
 		// 30s across the low-priority regions would burn ~1,200 tokens per window
 		// purely to re-learn that there is no budget, which keeps the budget short.
+		//
+		// A deferral leaves an open run of failures open. It is not evidence that
+		// an earlier fault cleared, so it must not re-arm the report.
 		if res.Outcome == OutcomeDeferred {
 			s.due[r.ID] = s.nextDue(res.Meta.Expires)
 			s.log.Info("region deferred", "region", r.Name, "reason", cause,
@@ -232,6 +247,7 @@ func (s *Scheduler) runRegion(ctx context.Context, r region.Region) {
 			s.log.Error("region cycle failed",
 				"region", r.Name, "priority", r.Priority, "attempts", attempt,
 				"outcome", res.Outcome, "err", cause)
+			s.noteFailure(r, cause, res.Outcome, attempt)
 			// The previous snapshot is still live and still correct, so simply
 			// wait for the next tick rather than hammering.
 			s.due[r.ID] = time.Now().Add(30 * time.Second)
@@ -254,6 +270,48 @@ func (s *Scheduler) runRegion(ctx context.Context, r region.Region) {
 		}
 	}
 }
+
+// noteFailure reports a region cycle that ran out of retries, once per run of
+// failures. The message stays whatever the cause says; the region goes in a tag,
+// because 25 region names are a dimension worth filtering on.
+func (s *Scheduler) noteFailure(r region.Region, cause error, outcome string, attempts int) {
+	if !s.reports.first(r.Name) {
+		return
+	}
+	sentry.WithScope(func(scope *sentry.Scope) {
+		scope.SetTag("component", "scheduler")
+		scope.SetTag("region", r.Name)
+		scope.SetContext("cycle", sentry.Context{
+			"region_id": r.ID,
+			"priority":  r.Priority,
+			"outcome":   outcome,
+			"attempts":  attempts,
+		})
+		sentry.CaptureException(cause)
+	})
+}
+
+// noteErrorLimit reports the legacy per-IP error limit, once per trip.
+//
+// The budget floor and the 5xx pause deliberately send nothing: both are this
+// service backing off from its own upstream, and both clear in minutes. This one
+// is different. The legacy limit is counted per source IP, so tripping it returns
+// 420 to every other application on this host, including calls this service knows
+// nothing about. A person must look.
+func (s *Scheduler) noteErrorLimit(d time.Duration) {
+	if !s.reports.first(keyErrorLimit) {
+		return
+	}
+	sentry.WithScope(func(scope *sentry.Scope) {
+		scope.SetTag("component", "scheduler")
+		scope.SetContext("error_limit", sentry.Context{"resumes_in_s": int(d.Seconds())})
+		sentry.CaptureException(errErrorLimitTripped)
+	})
+}
+
+// errErrorLimitTripped keeps the issue title constant. The remaining wait varies
+// every trip, so it belongs in the context rather than in the message.
+var errErrorLimitTripped = errors.New("esi error limit tripped, all requests paused")
 
 // canary spends 2 tokens on the cheapest real region to learn whether the budget
 // has recovered. The global PLEX market is one page, and its data is wanted anyway.

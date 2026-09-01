@@ -1,11 +1,13 @@
 package ingest
 
 import (
+	"errors"
 	"slices"
 	"testing"
 	"time"
 
 	"marketmanager/internal/everef"
+	"marketmanager/internal/sentrytest"
 	"marketmanager/internal/store"
 )
 
@@ -103,5 +105,38 @@ func TestSelectDaysIsOrderedOldestFirst(t *testing.T) {
 	want := []string{day(-5), day(-3), day(-1)}
 	if !slices.Equal(got, want) {
 		t.Errorf("selectDays = %v, want %v", got, want)
+	}
+}
+
+// EVE Ref is a best-effort third party polled every 15 minutes, so each failure
+// site reports once per run. The day is payload rather than a tag: a dimension
+// with one value per day in the backfill window is useless to filter on.
+func TestHistoryReportsOncePerSiteRun(t *testing.T) {
+	sink := sentrytest.Capture(t)
+	h := &HistoryImporter{}
+	boom := errors.New("everef unreachable")
+
+	h.note(jobTotals, "", boom)
+	h.note(jobTotals, "", boom)
+	h.note(jobImportDay, "2026-08-30", boom)
+	if got := len(sink.Captured()); got != 2 {
+		t.Fatalf("events = %d, want one per site", got)
+	}
+
+	h.reports.ends(jobTotals)
+	h.note(jobTotals, "", boom)
+
+	events := sink.Captured()
+	if len(events) != 3 {
+		t.Fatalf("events after a success ended the run = %d, want 3", len(events))
+	}
+	if events[0].Tags["component"] != "history" || events[0].Tags["job"] != jobTotals {
+		t.Errorf("tags = %v, want component=history job=%s", events[0].Tags, jobTotals)
+	}
+	if _, ok := events[0].Contexts["history"]; ok {
+		t.Error("a site with no day must set no history context")
+	}
+	if got := events[1].Contexts["history"]["day"]; got != "2026-08-30" {
+		t.Errorf("history context day = %v, want 2026-08-30", got)
 	}
 }
